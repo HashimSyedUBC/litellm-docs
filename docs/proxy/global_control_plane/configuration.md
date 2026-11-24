@@ -239,6 +239,50 @@ Service tokens are LiteLLM virtual API keys sent as bearer credentials. They nee
 
 <span id="requests-and-usage" />
 
+## Replicate request logs across regions
+
+Run a request-log replication worker for each regional Postgres database. The worker runs as a component of the standard LiteLLM image. It publishes request-log metadata and counters from its regional database to a shared Kafka topic and copies records from other regions into its database. Use a distinct region ID for each database. Workers serving the same database use the same ID so they share a Kafka consumer group.
+
+Apply the LiteLLM database migrations to each regional database before starting its worker. On PostgreSQL 10, install the `pgcrypto` extension before starting the worker. Create a Kafka topic for the fleet with retention long enough for an offline region to catch up. Load the broker credentials from your secret manager and inject these variables into each worker:
+
+| Environment variable | Value |
+| --- | --- |
+| `DATABASE_URL` | Direct connection string for the regional PostgreSQL database. The worker uses the URL's `schema` and ignores Prisma pool settings. Use libpq options for TLS. |
+| `LITELLM_SPEND_LOG_KAFKA_REGION` | Stable, unique ID for the regional database, such as `us-east`. |
+| `LITELLM_SPEND_LOG_KAFKA_REQUEST_ID_KEY` | A random 32-byte key encoded as 64 hex characters. Use the same key for every worker in the fleet and keep it stable to preserve request deduplication. |
+| `LITELLM_SPEND_LOG_KAFKA_CONFIG` | JSON object with Kafka client settings. Include `bootstrap.servers` and your broker's TLS and authentication settings. The default protocol is `SSL`. Use `SASL_SSL` for SASL. Both require certificate and hostname verification. Set `"security.protocol": "PLAINTEXT"` explicitly for a local development broker. |
+| `LITELLM_SPEND_LOG_KAFKA_TOPIC` | Shared fleet topic. Defaults to `litellm-spend-logs`. |
+
+```bash
+docker run --rm \
+  -e DATABASE_URL \
+  -e LITELLM_SPEND_LOG_KAFKA_REGION \
+  -e LITELLM_SPEND_LOG_KAFKA_REQUEST_ID_KEY \
+  -e LITELLM_SPEND_LOG_KAFKA_CONFIG \
+  -e LITELLM_SPEND_LOG_KAFKA_TOPIC \
+  ghcr.io/berriai/litellm:<version> spend-log-replication
+```
+
+The first startup enables capture for future inserts and updates in that database. Capture stays enabled when the worker stops. Kafka outages keep unpublished metadata in the regional Postgres outbox. Monitor the outbox's growth. When a worker reconnects, it resumes publishing and consuming. A worker commits offsets after Postgres commits the rows, so a restart can replay a batch without adding a second copy of a request.
+
+The worker omits oversized display fields and uses a SHA-256 digest for team, user, and end-user IDs larger than 2 KiB or starting with `sha256:`. The budget check uses the same digest to look up imported spend. Use the original ID in Admin Logs filters and search. The worker removes records that still exceed 256 KiB or that Kafka rejects for size on an individual retry, logs the count, and continues publishing. The original request log stays in the source database.
+
+In the regional Admin UI, open **Logs → Request Logs** to pause or resume capture for new local writes. During a pause, the worker continues to publish already captured logs and import logs from other regions. Writes made during the pause are counted in the source region. Other regions do not receive them, even after capture resumes.
+
+Kafka receives an allowlist of request metadata and counters, including request, model, team, organization, user, end-user and hashed key identifiers, token counts, spend, status, timestamps, and the source region. Prompts, messages, responses, headers, request bodies, and free-form metadata stay in the source region. Restrict topic access to the workers and use a separate topic per fleet.
+
+When a request ID contains the caller's correlation header, other regions display a stable replica ID derived with the fleet's request ID key. The source region keeps the original request ID.
+
+Each database stores imported metadata in `LiteLLM_ReplicatedSpendLogs`. The regional Admin UI lists local and imported requests and shows the source region under each imported request ID. Open a request in its source region to see its original payload. For SQL reports across the fleet, query `LiteLLM_SpendLogReporting`. Its `source_region` column identifies imported rows and is null for local rows. When a local row and a replica share a request ID and start time, the view returns the local row.
+
+Key, team, user, and end-user spend limits apply to local spend plus imported spend as soon as the regional worker commits it. Configured budget windows include imports from the current window. Use matching entity IDs and budget schedules across regions and keep the Redis spend counters scoped to each regional database. Budget decisions reflect the latest imported data and can lag during broker outages or consumer catch-up.
+
+A manual key spend reset starts a new spend boundary for that key in the region where you issue it. The region ignores imported requests that started before that boundary, including when Kafka replays them. To reset a key in every region, issue the reset in each region.
+
+Regional counters, cold seeds, settlement, and daily rollups use local accounting data. The budget check adds imported spend from `LiteLLM_FleetBudgetSpend`, which counts each request ID and start time once and gives local accounting precedence. This table retains its spend records and deduplication keys after reporting logs expire so active budgets and replay protection survive log cleanup. `maximum_spend_logs_retention_period` expires local and imported reporting rows. `maximum_spend_logs_size` counts both sets of reporting rows toward the same regional storage limit.
+
+When you backfill an existing request-log table after partitioning, run the backfill with `SET LOCAL litellm.spend_log_replica = 'on'` in the same transaction as the copy. This keeps historical rows out of the replication topic.
+
 ## Fleet
 
 | Environment variable | Default | Purpose |
